@@ -1,0 +1,23 @@
+[package]
+name = "read-after-link"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "A rustc wrapper that reads each newly linked proc-macro DLL once before cargo loads it, working around a Windows race that maps it with zeroed pages"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xangelix/read-after-link"
+readme = "README.md"
+authors = ["Cody Wyatt Neiman (xangelix) <neiman@cody.to>"]
+keywords = ["rustc-wrapper", "sccache", "windows", "proc-macro", "ci"]
+categories = ["development-tools::build-utils"]
+exclude = [".github/"]
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
