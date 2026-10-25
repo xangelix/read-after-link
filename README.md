@@ -50,6 +50,8 @@ container with a target directory shared with the host.
 | --- | --- |
 | CI builds through sccache from a clean target directory | 9 of about 45 |
 | The same, with this read after each proc macro links | 0 of about 45 |
+| Confirmation with this crate: builds through sccache alone | 50 of 180 |
+| Confirmation with this crate: builds through this crate in front of sccache | 0 of 180 |
 | Standalone (no cargo, sccache, or rustc), in the mounted build directory: load racing the first read | 5 of 1,250 |
 | Standalone, mounted directory, with the read completed before the load | 0 of 875 |
 | Standalone, mounted directory, with `FlushFileBuffers` after the write | 0 of 500 |
