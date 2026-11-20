@@ -12,6 +12,11 @@
 //! (sccache, for example), and passes its exit status back. After a successful compile whose crate
 //! types make a dynamic library (`proc-macro`, `dylib`, `cdylib`), it reads that library on
 //! Windows. Elsewhere it reads nothing.
+//!
+//! On Windows, a compile whose command line, with its argument files (`@path`) expanded, is too
+//! long for the other wrapper to start runs without that wrapper (see
+//! [`WRAPPED_COMMAND_LINE_MAX`]): the compiler gets the arguments as given, argument files
+//! included, and reads them itself.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -26,6 +31,21 @@ const WRAPPER_VAR: &str = "READ_AFTER_LINK_WRAPPER";
 const LOG_VAR: &str = "READ_AFTER_LINK_LOG";
 /// The read size: what sccache uses to hash files.
 const CHUNK: usize = 128 * 1024;
+/// The longest command line Windows starts a process with (`CreateProcessW`): 32,767 UTF-16 units,
+/// its terminating null included.
+const WINDOWS_COMMAND_LINE_MAX: usize = 32_767;
+/// The longest command line, its argument files expanded, that a compile may have for this
+/// wrapper to hand it to `READ_AFTER_LINK_WRAPPER` on Windows.
+///
+/// Cargo passes a command line Windows would refuse as an argument file (`@path`), which the
+/// compiler reads itself. sccache (up to 0.19 at least, mozilla/sccache#3053) expands argument
+/// files and starts the compiler with every argument on its command line, so such a compile fails
+/// there: "The filename or extension is too long. (os error 206)". Since cargo 1.100 a command line
+/// grows with the crate's dependency graph (one `-L dependency=` per dependency's build directory):
+/// a crate with about 350 dependencies needed 34,044 characters, and sccache added 91 more for its
+/// dependency pass (`--emit dep-info -o <a temporary file>`). Below the limit, this leaves room
+/// for what a wrapper adds; a longer compile runs without the wrapper (it is not cached).
+const WRAPPED_COMMAND_LINE_MAX: usize = WINDOWS_COMMAND_LINE_MAX - 2_767;
 /// The crate types whose output is a dynamic library.
 const DYNAMIC: [&str; 3] = ["proc-macro", "dylib", "cdylib"];
 
@@ -35,14 +55,17 @@ fn usage() -> String {
 
 A rustc wrapper. It runs the compiler it is given, through {WRAPPER_VAR} when that is set, and
 when a compile links a dynamic library (proc-macro, dylib, cdylib), it reads the new library once,
-start to end, before it exits. It reads only on Windows.
+start to end, before it exits. It reads only on Windows. On Windows, a compile whose command line,
+its argument files expanded, is longer than {WRAPPED_COMMAND_LINE_MAX} characters runs without
+{WRAPPER_VAR}.
 
 Usage: RUSTC_WRAPPER=read-after-link cargo build
        read-after-link <compiler> [<argument>...]
 
 Environment:
   {WRAPPER_VAR}  another wrapper to run the compiler through (for example sccache)
-  {LOG_VAR}      a file to append one line to per library: read, found, missing, or failed
+  {LOG_VAR}      a file to append one line to per library (read, found, missing, or failed)
+                          and per compile run without the other wrapper (direct)
 ",
         version = env!("CARGO_PKG_VERSION"),
     )
@@ -68,14 +91,23 @@ fn main() {
         process::exit(2);
     };
     // Found before the compile runs: cargo removes an argument file once the compiler exits.
-    let library = library(&parse(&expand(compiler_args)));
-    let mut command = match command(compiler, compiler_args) {
+    let expanded = expand(compiler_args);
+    let compile = parse(&expanded);
+    let library = library(&compile);
+    let wrapper = env::var_os(WRAPPER_VAR).filter(|wrapper| !wrapper.is_empty());
+    let length = command_line_length(compiler, &expanded);
+    let too_long = cfg!(windows) && length > WRAPPED_COMMAND_LINE_MAX;
+    let bypassed = too_long && wrapper.is_some();
+    let mut command = match command(compiler, compiler_args, wrapper, too_long) {
         Ok(command) => command,
         Err(message) => {
             eprintln!("read-after-link: {message}");
             process::exit(2);
         }
     };
+    if bypassed {
+        note_direct(length, &compile);
+    }
     let code = match command.status() {
         Ok(status) => exit_code(status),
         Err(error) => {
@@ -94,13 +126,30 @@ fn main() {
     process::exit(code);
 }
 
-/// The command that compiles: the compiler, or `READ_AFTER_LINK_WRAPPER` with the compiler as its
-/// first argument.
-fn command(compiler: &OsStr, args: &[OsString]) -> Result<Command, String> {
-    let Some(wrapper) = env::var_os(WRAPPER_VAR).filter(|wrapper| !wrapper.is_empty()) else {
+/// Notes a compile that runs without the other wrapper in the log.
+fn note_direct(length: usize, compile: &Compile) {
+    log(&format!(
+        "direct\t{length}\t{}",
+        compile.crate_name.as_deref().unwrap_or("-")
+    ));
+}
+
+/// The command that compiles: the compiler, or `wrapper` (`READ_AFTER_LINK_WRAPPER`) with the
+/// compiler as its first argument. `too_long` (a Windows command line too long for the wrapper to
+/// start, [`WRAPPED_COMMAND_LINE_MAX`]) runs the compiler itself, with the arguments as given.
+fn command(
+    compiler: &OsStr,
+    args: &[OsString],
+    wrapper: Option<OsString>,
+    too_long: bool,
+) -> Result<Command, String> {
+    let direct = || {
         let mut command = Command::new(compiler);
         command.args(args);
-        return Ok(command);
+        command
+    };
+    let Some(wrapper) = wrapper.filter(|wrapper| !wrapper.is_empty()) else {
+        return Ok(direct());
     };
     let Some(path) = locate(&wrapper) else {
         return Err(format!(
@@ -114,9 +163,50 @@ fn command(compiler: &OsStr, args: &[OsString]) -> Result<Command, String> {
             path.display()
         ));
     }
+    if too_long {
+        return Ok(direct());
+    }
     let mut command = Command::new(path);
     command.arg(compiler).args(args);
     Ok(command)
+}
+
+/// The length of the command line Windows gets for `program` and `args`, in UTF-16 units with the
+/// terminating null, as Rust's standard library builds it: the program always in quotes, then each
+/// argument after a space, in quotes when it is empty or holds a space or a tab, with each double
+/// quote escaped by a backslash and the backslashes before it (or before a closing quote) doubled.
+fn command_line_length(program: &OsStr, args: &[OsString]) -> usize {
+    fn quoted(arg: &str, always: bool) -> usize {
+        let quote = always || arg.is_empty() || arg.contains([' ', '\t']);
+        let mut length = 0_usize;
+        let mut backslashes = 0_usize;
+        for unit in arg.encode_utf16() {
+            if unit == u16::from(b'\\') {
+                backslashes = backslashes.saturating_add(1);
+            } else {
+                if unit == u16::from(b'"') {
+                    // The backslashes before it doubled, and one for the quote itself.
+                    length = length.saturating_add(backslashes).saturating_add(1);
+                }
+                backslashes = 0;
+            }
+            length = length.saturating_add(1);
+        }
+        if quote {
+            // The opening and closing quotes, and the backslashes before the closing one doubled.
+            length = length.saturating_add(backslashes).saturating_add(2);
+        }
+        length
+    }
+    args.iter().fold(
+        // The program, and the terminating null.
+        quoted(&program.to_string_lossy(), true).saturating_add(1),
+        |length, arg| {
+            length
+                .saturating_add(1)
+                .saturating_add(quoted(&arg.to_string_lossy(), false))
+        },
+    )
 }
 
 /// The program a wrapper names: a path as given, or a bare name found on `PATH` (and only there:
@@ -596,6 +686,107 @@ mod tests {
         assert_eq!(expand(&line), line);
         let missing = vec![OsString::from("@no/such/file")];
         assert_eq!(expand(&missing), missing);
+        fs::remove_dir_all(dir).expect("the scratch directory is removed");
+    }
+
+    #[test]
+    fn command_lines_are_measured_as_windows_gets_them() {
+        let program = OsStr::new("rustc");
+        // `"rustc"` and the terminating null.
+        assert_eq!(command_line_length(program, &[]), 8);
+        let line = [
+            "a",         // a
+            "a b",       // "a b"
+            "",          // ""
+            "a\"b",      // a\"b
+            "C:\\x y\\", // "C:\x y\\"
+            "a\\\"b",    // a\\\"b
+        ];
+        assert_eq!(
+            command_line_length(program, &args(&line)),
+            8 + 2 + 6 + 3 + 5 + 11 + 7
+        );
+    }
+
+    /// A cargo argument file as cargo 1.100 writes one on Windows for a crate with a large
+    /// dependency graph: one `-L dependency=<build directory>` per dependency, one per line.
+    fn cargo_argument_file(dependencies: usize) -> String {
+        let mut lines = vec![
+            "--crate-name".to_owned(),
+            "app".to_owned(),
+            "--edition=2024".to_owned(),
+            "src\\lib.rs".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+        ];
+        for dependency in 0..dependencies {
+            lines.push("-L".to_owned());
+            lines.push(format!(
+                "dependency=C:\\b\\x86_64-pc-windows-msvc\\debug\\build\\crate-{dependency:04}/{dependency:016x}\\out"
+            ));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn a_long_argument_file_is_measured_expanded() {
+        let dir = scratch("long");
+        let file = dir.join("args");
+        let compiler = OsStr::new(r"C:\toolchain\bin\rustc.exe");
+        let line = vec![OsString::from(format!("@{}", file.display()))];
+        // The `-L` entries of 349 dependencies (a measured crate's count) take over 30,000
+        // characters alone; with its other arguments, that crate's command line took 34,044.
+        fs::write(&file, cargo_argument_file(349)).expect("the argument file is written");
+        let long = command_line_length(compiler, &expand(&line));
+        assert!(long > WRAPPED_COMMAND_LINE_MAX, "{long}");
+        // The file itself stays short on the command line.
+        assert!(command_line_length(compiler, &line) < 1_000);
+        // 400 are past what Windows starts at all, expanded.
+        fs::write(&file, cargo_argument_file(400)).expect("the argument file is written");
+        let longer = command_line_length(compiler, &expand(&line));
+        assert!(longer > WINDOWS_COMMAND_LINE_MAX, "{longer}");
+        // A third of them stays well under.
+        fs::write(&file, cargo_argument_file(116)).expect("the argument file is written");
+        let short = command_line_length(compiler, &expand(&line));
+        assert!(short < WRAPPED_COMMAND_LINE_MAX / 2, "{short}");
+        fs::remove_dir_all(dir).expect("the scratch directory is removed");
+    }
+
+    #[test]
+    fn a_compile_too_long_for_the_wrapper_runs_without_it() {
+        let dir = scratch("direct");
+        let wrapper = dir.join(if cfg!(windows) {
+            "sccache.exe"
+        } else {
+            "sccache"
+        });
+        fs::write(&wrapper, b"").expect("the wrapper is written");
+        let compiler = OsStr::new("rustc");
+        let line = args(&["@args", "--cap-lints", "allow"]);
+        let shown = |command: &Command| {
+            std::iter::once(command.get_program())
+                .chain(command.get_args())
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let through = command(compiler, &line, Some(wrapper.clone().into()), false)
+            .expect("the wrapper is found");
+        assert_eq!(
+            shown(&through),
+            [
+                &*wrapper.to_string_lossy(),
+                "rustc",
+                "@args",
+                "--cap-lints",
+                "allow"
+            ]
+        );
+        // The argument file goes to the compiler as it is, for the compiler to read.
+        let direct =
+            command(compiler, &line, Some(wrapper.into()), true).expect("the wrapper is found");
+        assert_eq!(shown(&direct), ["rustc", "@args", "--cap-lints", "allow"]);
+        let alone = command(compiler, &line, None, true).expect("no wrapper is needed");
+        assert_eq!(shown(&alone), ["rustc", "@args", "--cap-lints", "allow"]);
         fs::remove_dir_all(dir).expect("the scratch directory is removed");
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "read-after-link"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.87"
 description = "A rustc wrapper that reads each newly linked proc-macro DLL once before cargo loads it, working around a Windows race that maps it with zeroed pages"

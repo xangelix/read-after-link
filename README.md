@@ -98,12 +98,29 @@ The copy passes C and C++ compiles to sccache unchanged: they link no Rust libra
 nothing. If `READ_AFTER_LINK_WRAPPER` names the wrapper itself, it refuses to run rather than run
 itself forever.
 
+### Long command lines on Windows
+
+Windows starts no process whose command line is longer than 32,767 characters. Cargo passes a
+longer one to the wrapper as an argument file (`@path`), which rustc reads itself. sccache expands
+argument files and starts rustc with every argument on its command line, so such a compile fails
+through it: "The filename or extension is too long. (os error 206)"
+([mozilla/sccache#3053](https://github.com/mozilla/sccache/issues/3053)). Since cargo 1.100, a
+command line grows with the crate's dependency graph: rustc gets one `-L dependency=` for each
+dependency's build directory. A crate with about 350 dependencies needed 34,044 characters, and
+sccache added 91 more for its dependency pass.
+
+So on Windows, a compile whose command line, its argument files expanded, is longer than 30,000
+characters runs without `READ_AFTER_LINK_WRAPPER`: the compiler gets the arguments as given,
+argument files included. The rest of the limit leaves room for what the other wrapper adds.
+Such a compile is not cached, and the wrapper still reads its library afterwards. The log notes
+it (`direct`).
+
 ## Configuration
 
 | Variable | Meaning |
 | --- | --- |
 | `READ_AFTER_LINK_WRAPPER` | Another wrapper to run the compiler through, such as sccache. A full path is used as given; a bare name is looked up on `PATH`. |
-| `READ_AFTER_LINK_LOG` | A file to append one line to per library: `read<TAB>bytes<TAB>path`, `found<TAB>path` (other platforms), `missing<TAB>path`, or `failed<TAB>error<TAB>path`. |
+| `READ_AFTER_LINK_LOG` | A file to append one line to per library: `read<TAB>bytes<TAB>path`, `found<TAB>path` (other platforms), `missing<TAB>path`, or `failed<TAB>error<TAB>path`; and one per compile run without `READ_AFTER_LINK_WRAPPER` because its command line is too long: `direct<TAB>characters<TAB>crate`. |
 
 `read-after-link --version` and `--help` work when given as the only argument.
 
@@ -111,7 +128,8 @@ itself forever.
 
 - It runs `<compiler> <arguments>`, or `$READ_AFTER_LINK_WRAPPER <compiler> <arguments>`, with the
   same standard input, output, and error, and exits with the compiler's exit code. It doesn't
-  interpret the output.
+  interpret the output. On Windows, a compile whose expanded command line is longer than 30,000
+  characters runs as `<compiler> <arguments>` (see "Long command lines on Windows").
 - It reads the library only after a successful compile whose crate types include `proc-macro`,
   `dylib`, or `cdylib`, and only on Windows. On other platforms it only passes compiles through,
   and the log says `found`.
